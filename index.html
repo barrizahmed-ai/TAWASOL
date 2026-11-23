@@ -177,6 +177,16 @@ textarea.field{resize:vertical;min-height:90px;line-height:1.7}
 .quick{position:sticky;top:96px;z-index:1;padding:12px 14px;background:#fff8e6;border:1.5px solid #ecd49c}
 .quick .chips{margin-top:8px}
 .sib{display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--line);background:#fff;border-radius:10px;padding:6px 10px;font-size:13px}
+/* ---------- dialog ---------- */
+.dscrim{position:fixed;inset:0;background:rgba(14,30,28,.45);z-index:60;animation:fade .15s}
+.dlg{position:fixed;z-index:61;left:50%;top:50%;transform:translate(-50%,-50%);width:min(500px,94vw);max-height:92vh;overflow:auto;padding:18px 18px 16px;background:var(--card)}
+.dlg h3{margin:0;font-size:17px;display:flex;gap:8px;align-items:center;color:var(--teal)}
+.dlg .dsub{color:var(--muted);font-size:13px;margin-top:3px}
+.dlg .l{display:block;font-size:12.5px;color:var(--ink2);font-weight:700;margin:14px 0 7px}
+.dlg .acts2{display:flex;gap:8px;margin-top:18px}
+.dlg .acts2 .btn{flex:1;padding:12px}
+.dlg .chip{cursor:pointer}
+@media (max-width:900px){.dlg{top:auto;bottom:0;transform:translateX(-50%);width:100%;border-radius:20px 20px 0 0;padding-bottom:max(16px,env(safe-area-inset-bottom));max-height:88vh}}
 /* ---------- toast ---------- */
 #toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--ink);color:#fff;padding:11px 18px;border-radius:12px;font-size:14px;opacity:0;pointer-events:none;transition:.2s;z-index:80;max-width:90%;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%)}
@@ -240,6 +250,7 @@ textarea.field{resize:vertical;min-height:90px;line-height:1.7}
 <div id="lock"></div>
 <div id="app" class="hidden"></div>
 <div id="sheetRoot"></div>
+<div id="dlgRoot"></div>
 <div id="toast"></div>
 <div id="printArea"></div>
 <script>/*! xlsx.js (C) 2013-present SheetJS -- http://sheetjs.com */
@@ -394,7 +405,11 @@ const DEFAULT_TEMPLATES = [
 ];
 const FLAG_REASONS = ['غياب متكرر','خطر الانقطاع','صعوبات اجتماعية','سلوك','تعثر دراسي'];
 const CHANNELS = ['مكالمة','واتساب','رسالة نصية','استدعاء مكتوب','لقاء مباشر'];
-const RESULTS = ['تم التواصل','لم يرد','الهاتف مغلق','رقم خاطئ','حضر للمؤسسة','رسالة مرسلة'];
+const PURPOSES = ['غياب','تأخر','سلوك','استدعاء','النتائج الدراسية','تتبع اجتماعي','خطر الانقطاع','إخبار بنشاط','أخرى'];
+const CALL_RES = ['أجاب','لم يُجب','الهاتف مغلق','مشغول','رقم خاطئ','سيعاود الاتصال'];
+const MSG_RES = ['تم الإرسال','تم الرد','لم يرد بعد'];
+const RESULTS = [...CALL_RES, 'تم الإرسال', 'تم الرد', 'حضر للمؤسسة'];
+const BAD_RES = /لم|مغلق|خاطئ|مشغول/;
 const RELS = ['الأب','الأم','الولي','الأخ/الأخت','الجد/الجدة','العم/الخال','آخر'];
 
 function defaultSettings(){
@@ -542,9 +557,9 @@ function mergeStates(a, b){
     const other = base === sn ? so : sn;
     const del = new Set([...(base.del || []), ...(other.del || [])]);
     base.del = [...del];
-    const ids = new Set(base.log.map(l => l.id));
-    for (const l of other.log || []) if (!ids.has(l.id)) base.log.push(l);
-    base.log = base.log.filter(l => !del.has(l.id));
+    const lm = new Map();
+    for (const l of [...(other.log || []), ...base.log]){ const o = lm.get(l.id); if (!o || (l.u || 0) >= (o.u || 0)) lm.set(l.id, l); }
+    base.log = [...lm.values()].filter(l => !del.has(l.id));
     base.log.sort((x, y) => (y.d || '').localeCompare(x.d || ''));
     const nums = new Set(base.extra.phones.map(p => p.num));
     for (const p of other.extra.phones || []) if (!nums.has(p.num)) base.extra.phones.push(p);
@@ -613,16 +628,22 @@ async function remoteWrite(c, vault, expectHead){
   return commit.sha;
 }
 const keyCache = {};
+function cacheSess(){ if (SESS) keyCache[b64e(SESS.salt) + ':' + SESS.it] = SESS.K; }
+function adoptRemote(o, v){
+  // both devices end up using the same key, so later syncs need no password
+  if (v.salt !== b64e(SESS.salt) || v.it !== SESS.it){ SESS = {K:o.sess.K, salt:o.sess.salt, it:o.sess.it, pw:o.sess.pw || SESS.pw}; cacheSess(); SYNC.rekeyed = true; persistSession(); }
+  return o;
+}
 async function openRemoteVault(v){
-  try { return await openVault(v, SESS.pw, keyCache); }
-  catch(e){
-    const pw = prompt('النسخة الموجودة في المزامنة مشفرة بكلمة سر مختلفة (كلمة سر الجهاز الآخر). اكتبها لتوحيد كلمة السر في الجهازين:');
-    if (!pw) throw Object.assign(new Error('pw'), {status:'pw'});
-    const o = await openVault(v, pw, {});
-    const salt = rnd(16); SESS = {K: await deriveKey(pw, salt, ITER), salt, it: ITER, pw};
-    toast('أصبحت كلمة السر في هذا الجهاز هي نفسها كلمة سر الجهاز الآخر');
-    return o;
-  }
+  cacheSess();
+  const sk = v.salt + ':' + v.it;
+  if (keyCache[sk]){ try { return adoptRemote(await openVault(v, null, keyCache), v); } catch(e){} }
+  if (SESS.pw){ try { return adoptRemote(await openVault(v, SESS.pw, keyCache), v); } catch(e){} }
+  const pw = prompt('لإتمام المزامنة اكتب كلمة سر التطبيق (إن كانت مختلفة في الجهاز الآخر فاكتب كلمة سره):');
+  if (!pw) throw Object.assign(new Error('pw'), {status:'pw'});
+  const o = await openVault(v, pw, {});
+  if (SESS.pw && pw !== SESS.pw) toast('أصبحت كلمة السر في هذا الجهاز هي نفسها كلمة سر الجهاز الآخر');
+  return adoptRemote(o, v);
 }
 function syncLabel(){
   if (!syncCfg()) return '';
@@ -661,7 +682,7 @@ async function syncNow(force){
       }
       break;
     }
-    if (changed) await saveNow();
+    if (changed || SYNC.rekeyed){ SYNC.rekeyed = false; await saveNow(); }
     SYNC.status = 'ok'; SYNC.err = ''; SYNC.last = Date.now();
   } catch(e){
     SYNC.status = 'err';
@@ -683,6 +704,33 @@ function syncStateHTML(){
   if (!c.on) return '<div class="alert amb">المزامنة متوقفة. كل جهاز يحتفظ بمعطياته وحده.</div>';
   const cls = SYNC.status === 'err' ? 'red' : SYNC.status === 'ok' ? 'tl' : 'amb';
   return `<div class="alert ${cls}">${SYNC.status === 'err' ? esc(SYNC.err) : SYNC.status === 'ok' ? 'المزامنة تعمل. آخر مزامنة على الساعة ' + new Date(SYNC.last).toTimeString().slice(0, 5) + '.' : 'جارٍ المزامنة…'}</div>`;
+}
+
+
+/* ================= session kept across app switching (IndexedDB) ================= */
+function idbOpen(){ return new Promise((res, rej) => { const r = indexedDB.open('ibnb_session', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function idbDo(mode, fn){ try { const db = await idbOpen(); return await new Promise((res, rej) => { const tx = db.transaction('kv', mode); const st = tx.objectStore('kv'); const r = fn(st); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error); }); } catch(e){ return null; } }
+const idbGet = k => idbDo('readonly', st => st.get(k));
+const idbSet = (k, v) => idbDo('readwrite', st => st.put(v, k));
+const idbDel = k => idbDo('readwrite', st => st.delete(k));
+let lastPersist = 0;
+function persistSession(force){
+  if (!unlocked || !SESS || !S) return;
+  if (!force && Date.now() - lastPersist < 15000) return;
+  lastPersist = Date.now();
+  idbSet('s', {kt:SESS.K.t, k:SESS.K.k, salt:b64e(SESS.salt), it:SESS.it, last:lastAct, lockMin:S.settings.lockMin});
+}
+async function tryResume(){
+  const ses = await idbGet('s'); const local = readLocalVault();
+  if (!ses || !local) return false;
+  if (Date.now() - ses.last > ses.lockMin * 60000 || local.salt !== ses.salt || local.it !== ses.it){ idbDel('s'); return false; }
+  try {
+    const K = {t:ses.kt, k:ses.k};
+    let pt = await aesDec(K, b64d(local.iv), b64d(local.ct)); if (local.z) pt = await gunz(pt);
+    S = upgrade(JSON.parse(td.decode(pt))); SESS = {K, salt:b64d(ses.salt), it:ses.it, pw:null};
+    derivedVer++; D = null; SYNC.ref = null; SYNC.dirty = true;
+    enterApp(); return true;
+  } catch(e){ idbDel('s'); return false; }
 }
 
 /* ================= lock screen ================= */
@@ -749,7 +797,7 @@ async function unlock(pw){
 }
 function lock(){
   if (!unlocked) return;
-  saveNow(); pushOnLock(S, SESS);
+  saveNow(); pushOnLock(S, SESS); idbDel('s'); closeDlg();
   unlocked = false; S = null; SESS = null; D = null; derivedVer++;
   ui.open = null; ui.q = '';
   $('#app').innerHTML = ''; $('#app').classList.add('hidden'); $('#sheetRoot').innerHTML = ''; $('#printArea').innerHTML = '';
@@ -757,11 +805,11 @@ function lock(){
   renderLock('unlock');
 }
 let lastAct = Date.now(), hiddenAt = 0;
-['pointerdown','keydown','touchstart','wheel','input'].forEach(ev => addEventListener(ev, () => lastAct = Date.now(), {passive:true, capture:true}));
+['pointerdown','keydown','touchstart','wheel','input'].forEach(ev => addEventListener(ev, () => { lastAct = Date.now(); persistSession(); }, {passive:true, capture:true}));
 setInterval(() => { if (unlocked && Date.now() - lastAct > S.settings.lockMin * 60000) lock(); }, 5000);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden){ hiddenAt = Date.now(); document.body.classList.add('veil'); if (unlocked) saveNow(); }
-  else { document.body.classList.remove('veil'); if (unlocked && hiddenAt && Date.now() - hiddenAt > S.settings.lockMin * 60000) lock(); }
+  if (document.hidden){ hiddenAt = Date.now(); document.body.classList.add('veil'); if (unlocked){ saveNow(); persistSession(true); } }
+  else { document.body.classList.remove('veil'); if (unlocked && Date.now() - lastAct > S.settings.lockMin * 60000) lock(); else if (unlocked) maybeAskResult(); }
 });
 addEventListener('beforeunload', () => { if (unlocked) saveNow(); });
 
@@ -775,7 +823,7 @@ const VIEWS = [
   {id:'settings', t:'الإعدادات', i:IC.settings}
 ];
 function enterApp(){
-  unlocked = true; lastAct = Date.now();
+  unlocked = true; lastAct = Date.now(); cacheSess(); setTimeout(() => { persistSession(true); maybeAskResult(true); }, 300);
   $('#lock').classList.add('hidden'); $('#lock').innerHTML = '';
   $('#app').classList.remove('hidden');
   if (!Object.keys(S.students).length) ui.view = 'settings';
@@ -882,7 +930,7 @@ function rowHTML(s){
       <div class="ln"><span class="tag cls" dir="ltr">${esc(s.cls)}</span>${p ? `<span class="phone">${fmtPhone(p.num)}</span><span>${esc(p.rels.join(' · '))}</span>` : ''}${tags.join('')}</div>
       ${qIsAdr ? `<div class="ln">${I(IC.home, 13)} ${hlText(adr.a)}</div>` : ''}
     </div>
-    ${p ? `<div class="acts"><a class="ib" href="tel:${p.num}" data-call="${s.code}|${p.num}|مكالمة" aria-label="اتصال">${I(IC.phone, 18)}</a><a class="ib wa" href="${waLink(p.num, '')}" target="_blank" rel="noopener noreferrer" data-call="${s.code}|${p.num}|واتساب" aria-label="واتساب">${I(IC.wa, 19)}</a></div>` : ''}
+    ${p ? `<div class="acts"><button class="ib" data-callask="${s.code}|${p.num}|مكالمة" aria-label="اتصال">${I(IC.phone, 18)}</button><button class="ib wa" data-callask="${s.code}|${p.num}|واتساب" aria-label="واتساب">${I(IC.wa, 19)}</button></div>` : ''}
   </div>`;
 }
 function renderResults(){
@@ -898,8 +946,8 @@ const waLink = (num, text) => `https://wa.me/212${num.slice(1)}${text ? '?text='
 const smsLink = (num, text) => `sms:${num}${text ? '?body=' + encodeURIComponent(text) : ''}`;
 
 /* ================= student sheet ================= */
-function openStudent(code){ ui.open = code; ui.pending = null; renderSheet(); }
-function closeSheet(){ ui.open = null; ui.pending = null; $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; if (ui.view === 'search') renderResults(); else renderView(); refreshBadges(); }
+function openStudent(code){ ui.open = code; renderSheet(); }
+function closeSheet(){ ui.open = null; $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; if (ui.view === 'search') renderResults(); else renderView(); refreshBadges(); }
 function fillTpl(body, s, date){
   const g = fullName(s.g) || fullName(s.f) || fullName(s.m);
   return body.replace(/\{التلميذ\}/g, sName(s)).replace(/\{القسم\}/g, s.cls).replace(/\{التاريخ\}/g, date ? fmtDate(date) : fmtDate(todayISO())).replace(/\{الولي\}/g, g).replace(/\{المؤسسة\}/g, S.settings.msgSign);
@@ -923,7 +971,6 @@ function renderSheet(){
       <div class="ln"><span class="tag" dir="ltr">${esc(s.cls)}</span><span dir="ltr">${esc(s.code)}</span>${s.level ? `<span>${esc(s.level)}</span>` : ''}${s.tut ? `<span>الوصاية: ${esc(s.tut)}</span>` : ''}</div>
     </div>
     <div class="sh-body">
-      ${ui.pending ? `<div class="card quick"><b>نتيجة ${esc(ui.pending.ch)} مع <span class="phone">${fmtPhone(ui.pending.num)}</span>؟</b><div class="chips">${RESULTS.map(r => `<button class="chip" data-res="${esc(r)}">${esc(r)}</button>`).join('')}<button class="chip" data-act="nopending">تجاهل</button></div></div>` : ''}
       ${s.missing ? `<div class="alert red">${I(IC.missing, 18)}<div>هذا التلميذ لم يظهر في آخر ملف مستورد لقسمه. قد يكون انتقل أو انقطع أو غيّر القسم.</div></div>` : ''}
       ${shared.length ? `<div class="alert amb">${I(IC.missing, 18)}<div>الرقم ${shared.map(c => `<span class="phone">${fmtPhone(c.num)}</span>`).join('، ')} مسجل أيضا لأسرة أخرى في المؤسسة. تحقق منه.</div></div>` : ''}
 
@@ -932,7 +979,7 @@ function renderSheet(){
         ${cs.length ? cs.map(c => `<div class="ph">
           <button class="star ${prim && prim.num === c.num ? 'on' : ''}" data-primary="${c.num}" title="الرقم الرئيسي" aria-label="الرقم الرئيسي">${I(IC.star, 19)}</button>
           <div class="info"><div class="phone">${fmtPhone(c.num)}</div><div class="rel">${esc(c.rels.join(' · '))}${c.names.length ? ' — ' + esc(c.names.join('، ')) : ''}${c.valid ? '' : ' · <span style="color:var(--red)">رقم غير صالح</span>'}</div></div>
-          ${c.valid ? `<div class="acts"><a class="ib" href="tel:${c.num}" data-call="${s.code}|${c.num}|مكالمة" aria-label="اتصال">${I(IC.phone, 18)}</a><a class="ib wa" href="${waLink(c.num, '')}" target="_blank" rel="noopener noreferrer" data-call="${s.code}|${c.num}|واتساب" aria-label="واتساب">${I(IC.wa, 19)}</a><a class="ib" href="${smsLink(c.num, '')}" data-call="${s.code}|${c.num}|رسالة نصية" aria-label="رسالة">${I(IC.sms, 18)}</a></div>` : ''}
+          ${c.valid ? `<div class="acts"><button class="ib" data-callask="${s.code}|${c.num}|مكالمة" aria-label="اتصال">${I(IC.phone, 18)}</button><button class="ib wa" data-callask="${s.code}|${c.num}|واتساب" aria-label="واتساب">${I(IC.wa, 19)}</button><button class="ib" data-callask="${s.code}|${c.num}|رسالة نصية" aria-label="رسالة">${I(IC.sms, 18)}</button></div>` : ''}
           ${c.manual ? `<button class="ib" style="background:var(--redbg);color:var(--red)" data-delphone="${c.ids[0]}" aria-label="حذف">${I(IC.trash, 17)}</button>` : ''}
         </div>`).join('') : `<div class="alert red">لا يوجد أي رقم هاتف في مسار لهذا التلميذ.</div>`}
         <form class="form" id="fPhone" style="margin-top:12px">
@@ -968,7 +1015,7 @@ function renderSheet(){
           <div><label>التاريخ</label><input class="field" type="date" id="msgDate" value="${msgDate}"></div>
           <div class="full"><textarea class="field" id="msgText" style="min-height:130px">${esc(msg)}</textarea></div>
           <div class="full" style="display:flex;gap:8px;flex-wrap:wrap">
-            ${prim ? `<a class="btn wa" id="sendWa" href="${waLink(prim.num, msg)}" target="_blank" rel="noopener noreferrer" data-call="${s.code}|${prim.num}|واتساب">${I(IC.wa, 18)} واتساب</a><a class="btn soft" id="sendSms" href="${smsLink(prim.num, msg)}" data-call="${s.code}|${prim.num}|رسالة نصية">${I(IC.sms, 17)} رسالة نصية</a>` : ''}
+            ${prim ? `<a class="btn wa" id="sendWa" href="${waLink(prim.num, msg)}" target="_blank" rel="noopener noreferrer" data-msglog="${s.code}|${prim.num}|واتساب">${I(IC.wa, 18)} واتساب</a><a class="btn soft" id="sendSms" href="${smsLink(prim.num, msg)}" data-msglog="${s.code}|${prim.num}|رسالة نصية">${I(IC.sms, 17)} رسالة نصية</a>` : ''}
             <button class="btn ghost" data-act="copymsg">${I(IC.copy, 17)} نسخ</button>
           </div>
           ${prim ? `<div class="full lockhint">تُرسل إلى الرقم الرئيسي <span class="phone">${fmtPhone(prim.num)}</span></div>` : ''}
@@ -987,9 +1034,10 @@ function renderSheet(){
 
       <div class="card sec">
         <h4>${I(IC.log, 17)} سجل التواصل <span class="r tag">${s.log.length}</span></h4>
-        ${s.log.length ? s.log.map(l => `<div class="logi"><div class="t"><span class="tag cls">${esc(l.ch)}</span>${l.res ? `<span class="tag ${/لم|مغلق|خاطئ/.test(l.res) ? 'red' : 'grn'}">${esc(l.res)}</span>` : ''}${l.num ? `<span class="phone" style="font-size:13px">${fmtPhone(l.num)}</span>` : ''}<span class="d">${fmtDate(l.d)}</span><button class="star" data-dellog="${l.id}" aria-label="حذف">${I(IC.trash, 15)}</button></div>${l.note ? `<p>${esc(l.note)}</p>` : ''}</div>`).join('') : '<div class="lockhint">لا يوجد أي تواصل مسجل بعد.</div>'}
+        ${s.log.length ? s.log.map(l => logItemHTML(s, l)).join('') : '<div class="lockhint">لا يوجد أي تواصل مسجل بعد.</div>'}
         <form class="form" id="fLog" style="margin-top:12px">
           <div><label>الوسيلة</label><select class="field" name="ch">${CHANNELS.map(c => `<option>${c}</option>`).join('')}</select></div>
+          <div><label>الهدف</label><select class="field" name="purpose">${PURPOSES.map(c => `<option>${c}</option>`).join('')}</select></div>
           <div><label>النتيجة</label><select class="field" name="res">${RESULTS.map(c => `<option>${c}</option>`).join('')}</select></div>
           <div><label>التاريخ والساعة</label><input class="field" type="datetime-local" name="d" value="${nowLocal()}"></div>
           <div><label>الرقم</label><select class="field" name="num"><option value="">—</option>${cs.map(c => `<option value="${c.num}">${fmtPhone(c.num)}</option>`).join('')}</select></div>
@@ -1020,8 +1068,8 @@ function bindSheet(s, tpl, sel){
   $('#tplSel').onchange = e => { ui.sheetTpl = e.target.value; ui.msgText = null; renderSheet(); };
   $('#msgDate').onchange = e => { ui.msgDate = e.target.value; ui.msgText = null; renderSheet(); };
   $('#msgText').oninput = e => { ui.msgText = e.target.value; ui.msgFor = s.code + sel; updMsgLinks(); };
-  $('#fConv').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); printConvocation(s, f.get('d'), f.get('t'), f.get('r')); s.log.unshift({id:uid(), d:nowLocal(), ch:'استدعاء مكتوب', res:'', num:'', note:`استدعاء للحضور يوم ${fmtDate(f.get('d'))} ${f.get('t') || ''} — ${f.get('r')}`}); touch(s); renderSheet(); };
-  $('#fLog').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); s.log.unshift({id:uid(), d:f.get('d') || nowLocal(), ch:f.get('ch'), res:f.get('res'), num:f.get('num'), note:clean(f.get('note'))}); s.log.sort((a, b) => b.d.localeCompare(a.d)); touch(s); renderSheet(); toast('سُجل التواصل'); };
+  $('#fConv').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); printConvocation(s, f.get('d'), f.get('t'), f.get('r')); s.log.unshift({id:uid(), d:nowLocal(), ch:'استدعاء مكتوب', purpose:'استدعاء', res:'', num:'', u:Date.now(), note:`استدعاء للحضور يوم ${fmtDate(f.get('d'))} ${f.get('t') || ''} — ${f.get('r')}`}); touch(s); renderSheet(); };
+  $('#fLog').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); s.log.unshift({id:uid(), d:f.get('d') || nowLocal(), ch:f.get('ch'), purpose:f.get('purpose'), res:f.get('res'), num:f.get('num'), note:clean(f.get('note')), u:Date.now()}); s.log.sort((a, b) => b.d.localeCompare(a.d)); touch(s); renderSheet(); toast('سُجل التواصل'); };
   root.querySelector('.sheet').scrollTop = ui.sheetScroll || 0; ui.sheetScroll = 0;
 }
 
@@ -1125,18 +1173,20 @@ function vLog(m){
   const d = derive();
   let arr = allLogs();
   if (ui.lcls) arr = arr.filter(x => x.s.cls === ui.lcls);
-  if (ui.lres) arr = arr.filter(x => x.l.res === ui.lres || x.l.ch === ui.lres);
+  if (ui.lres) arr = arr.filter(x => x.l.res === ui.lres || x.l.ch === ui.lres || x.l.purpose === ui.lres || (ui.lres === '__pending' && x.l.pending));
+  const pend = allLogs().filter(x => x.l.pending);
   const fl = sortStudents(d.list.filter(s => s.flag.on));
   m.innerHTML = `<h2 class="h2">سجل التواصل والتتبع</h2><p class="sub">كل الاتصالات والاستدعاءات المسجلة، مع لائحة التلاميذ في التتبع.</p>
+  ${pend.length ? `<div class="card sec" style="margin-bottom:14px;border-color:#ecd49c;background:#fffaf0"><h4 style="color:var(--amber)">${I(IC.log, 17)} اتصالات تنتظر تسجيل النتيجة (${pend.length})</h4>${pend.map(({s, l}) => `<div class="logi"><div class="t"><b>${esc(sName(s))}</b><span class="tag cls" dir="ltr">${esc(s.cls)}</span><span class="tag">${esc(l.ch)}</span>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}<span class="d">${fmtDate(l.d)}</span><button class="btn sm" data-complete="${esc(s.code)}|${l.id}">تسجيل النتيجة</button></div></div>`).join('')}</div>` : ''}
   ${fl.length ? `<div class="card sec" style="margin-bottom:14px"><h4>${I(IC.flag, 17)} في لائحة التتبع (${fl.length})</h4><div class="chips">${fl.map(s => `<button class="sib" data-open="${esc(s.code)}">${esc(sName(s))} <span class="tag cls" dir="ltr">${esc(s.cls)}</span>${s.flag.reasons.map(r => `<span class="tag flag">${esc(r)}</span>`).join('')}</button>`).join('')}</div></div>` : ''}
   <div class="filters">
     <select class="chip ${ui.lcls ? 'on' : ''}" id="lcls"><option value="">كل الأقسام</option>${d.classes.map(c => `<option ${c === ui.lcls ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
-    <select class="chip ${ui.lres ? 'on' : ''}" id="lres"><option value="">كل الحالات</option>${[...CHANNELS, ...RESULTS].map(c => `<option ${c === ui.lres ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+    <select class="chip ${ui.lres ? 'on' : ''}" id="lres"><option value="">كل الحالات</option><option value="__pending" ${ui.lres === '__pending' ? 'selected' : ''}>بانتظار النتيجة</option>${[...new Set([...CHANNELS, ...PURPOSES, ...RESULTS, ...allLogs().map(x => x.l.res).filter(Boolean)])].map(c => `<option ${c === ui.lres ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
     <button class="btn sm ghost" data-act="exportlog" style="margin-inline-start:auto">${I(IC.download, 15)} تصدير Excel</button>
   </div>
   <div class="meta">${arr.length} عملية</div>
-  ${arr.length ? `<div class="card scroll"><table class="tbl stack"><thead><tr><th>التاريخ</th><th>التلميذ</th><th>القسم</th><th>الوسيلة</th><th>النتيجة</th><th>ملاحظات</th></tr></thead><tbody>
-  ${arr.slice(0, 400).map(({s, l}) => `<tr><td style="white-space:nowrap;color:var(--muted);font-size:13px">${fmtDate(l.d)}</td><td><a href="#" data-open="${esc(s.code)}" style="font-weight:700;text-decoration:none">${esc(sName(s))}</a></td><td><span class="tag cls" dir="ltr">${esc(s.cls)}</span></td><td>${esc(l.ch)}</td><td>${l.res ? `<span class="tag ${/لم|مغلق|خاطئ/.test(l.res) ? 'red' : 'grn'}">${esc(l.res)}</span>` : ''}</td><td class="w">${esc(l.note || '')}</td></tr>`).join('')}
+  ${arr.length ? `<div class="card scroll"><table class="tbl stack"><thead><tr><th>التاريخ</th><th>التلميذ</th><th>القسم</th><th>الوسيلة</th><th>الهدف</th><th>النتيجة</th><th>ملاحظات</th></tr></thead><tbody>
+  ${arr.slice(0, 400).map(({s, l}) => `<tr><td style="white-space:nowrap;color:var(--muted);font-size:13px">${fmtDate(l.d)}</td><td><a href="#" data-open="${esc(s.code)}" style="font-weight:700;text-decoration:none">${esc(sName(s))}</a></td><td><span class="tag cls" dir="ltr">${esc(s.cls)}</span></td><td>${esc(l.ch)}</td><td>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}</td><td>${resTag(l, s)}</td><td class="w">${esc([l.detail, l.note].filter(Boolean).join(' — '))}</td></tr>`).join('')}
   </tbody></table></div>` : `<div class="card empty">${I(IC.log, 40)}<div>لا توجد عمليات مسجلة</div></div>`}`;
   $('#lcls').onchange = e => { ui.lcls = e.target.value; renderView(); };
   $('#lres').onchange = e => { ui.lres = e.target.value; renderView(); };
@@ -1185,7 +1235,7 @@ function vSettings(m){
     <div class="card sec">
       <h4>${I(IC.lock, 17)} الأمان</h4>
       <div class="form">
-        <div class="full"><label>القفل التلقائي بعد</label><select class="field" id="lockMin">${[2, 5, 10, 15, 30].map(n => `<option value="${n}" ${n === st.lockMin ? 'selected' : ''}>${n} دقائق دون استعمال</option>`).join('')}</select></div>
+        <div class="full"><label>القفل التلقائي بعد</label><select class="field" id="lockMin">${[5, 10, 15, 30, 60, 120].map(n => `<option value="${n}" ${n === st.lockMin ? 'selected' : ''}>${n} دقائق دون استعمال</option>`).join('')}</select></div>
       </div>
       <form class="form" id="fPw" style="margin-top:12px">
         <div class="full"><label>تغيير كلمة السر</label><input class="field" type="password" name="old" placeholder="كلمة السر الحالية" autocomplete="current-password" required></div>
@@ -1236,13 +1286,13 @@ function vSettings(m){
     SYNC.branch = null; SYNC.ref = null; SYNC.dirty = true; SYNC.status = 'busy';
     touch(); renderView(); syncNow(true);
   };
-  $('#lockMin').onchange = e => { st.lockMin = +e.target.value; touch(); toast('حُفظ'); };
+  $('#lockMin').onchange = e => { st.lockMin = +e.target.value; touch(); persistSession(true); toast('حُفظ'); };
   $('#fPw').onsubmit = async e => {
     e.preventDefault(); const f = new FormData(e.target);
     if (f.get('a') !== f.get('b')) return toast('كلمتا السر الجديدتان غير متطابقتين');
     const chk = await deriveKey(f.get('old'), SESS.salt, SESS.it);
     try { const v = await sealState(S, SESS); await aesDec(chk, b64d(v.iv), b64d(v.ct)); } catch(err){ return toast('كلمة السر الحالية غير صحيحة'); }
-    const salt = rnd(16); SESS = {K: await deriveKey(f.get('a'), salt, ITER), salt, it: ITER, pw: f.get('a')};
+    const salt = rnd(16); SESS = {K: await deriveKey(f.get('a'), salt, ITER), salt, it: ITER, pw: f.get('a')}; cacheSess(); setTimeout(() => persistSession(true), 500);
     touch(); await saveNow(); e.target.reset(); toast('تم تغيير كلمة السر. نزّل نسخة جديدة للهاتف.');
   };
   m.querySelectorAll('[data-tpl]').forEach(box => box.onchange = () => { const t = st.templates.find(x => x.id === box.dataset.tpl); t.title = box.querySelector('[name=title]').value.trim() || t.title; t.body = box.querySelector('[name=body]').value; touch(); toast('حُفظ النموذج'); });
@@ -1276,7 +1326,7 @@ function exportXlsx(){
   if (!confirm('سيُنشأ ملف Excel غير مشفر يحتوي على أرقام الهواتف والعناوين. هل تريد المتابعة؟')) return;
   const d = derive();
   const rows = sortStudents([...d.list]).map(s => { const cs = contacts(s).filter(c => c.valid); const p = primaryPhone(s); return {'القسم':s.cls, 'رقم مسار':s.code, 'النسب':s.nom, 'الاسم':s.prenom, 'نوع الوصاية':s.tut, 'ولي الأمر':fullName(s.g), 'الهاتف الرئيسي':p ? p.num : '', 'أرقام أخرى':cs.filter(c => !p || c.num !== p.num).map(c => c.num + ' (' + c.rels.join('/') + ')').join(' ، '), 'العنوان':addresses(s)[0]?.a || '', 'للتتبع':s.flag.on ? s.flag.reasons.join('، ') || 'نعم' : ''}; });
-  const logs = allLogs().map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'النتيجة':l.res || '', 'الرقم':l.num || '', 'ملاحظات':l.note || ''}));
+  const logs = allLogs().map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'الرقم':l.num || '', 'ملاحظات':l.note || ''}));
   const wb = XLSX.utils.book_new();
   const ws1 = XLSX.utils.json_to_sheet(rows); ws1['!cols'] = [10, 13, 14, 14, 10, 22, 13, 30, 40, 16].map(w => ({wch:w}));
   XLSX.utils.book_append_sheet(wb, ws1, 'الأرقام والعناوين');
@@ -1286,29 +1336,104 @@ function exportXlsx(){
   download(`contacts-${todayISO()}.xlsx`, new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
 }
 function exportLogXlsx(){
-  const logs = allLogs().filter(x => (!ui.lcls || x.s.cls === ui.lcls)).map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'النتيجة':l.res || '', 'ملاحظات':l.note || ''}));
+  const logs = allLogs().filter(x => (!ui.lcls || x.s.cls === ui.lcls)).map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'ملاحظات':l.note || ''}));
   if (!logs.length) return toast('السجل فارغ');
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(logs), 'سجل التواصل'); wb.Workbook = {Views:[{RTL:true}]};
   download(`sijil-tawasol-${todayISO()}.xlsx`, new Blob([XLSX.write(wb, {bookType:'xlsx', type:'array'})]));
 }
 
+
+/* ================= call dialogs ================= */
+let DLG = null;
+function closeDlg(){ DLG = null; const r = document.getElementById('dlgRoot'); if (r) r.innerHTML = ''; }
+function chLabel(ch){ return ch === 'مكالمة' ? 'اتصل الآن' : ch === 'واتساب' ? 'افتح واتساب' : 'افتح الرسائل'; }
+function chIcon(ch){ return ch === 'مكالمة' ? IC.phone : ch === 'واتساب' ? IC.wa : IC.sms; }
+function resTag(l){ if (l.pending) return `<span class="tag amb">بانتظار النتيجة</span>`; return l.res ? `<span class="tag ${BAD_RES.test(l.res) ? 'red' : 'grn'}">${esc(l.res)}</span>` : ''; }
+function logItemHTML(s, l){
+  return `<div class="logi"><div class="t"><span class="tag cls">${esc(l.ch)}</span>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}${resTag(l)}${l.num ? `<span class="phone" style="font-size:13px">${fmtPhone(l.num)}</span>` : ''}<span class="d">${fmtDate(l.d)}</span>${l.pending ? `<button class="btn sm" data-complete="${esc(s.code)}|${l.id}">تسجيل النتيجة</button>` : ''}<button class="star" data-dellog="${l.id}" aria-label="حذف">${I(IC.trash, 15)}</button></div>${l.detail ? `<p>${esc(l.detail)}</p>` : ''}${l.note ? `<p><b>الملاحظات:</b> ${esc(l.note)}</p>` : ''}</div>`;
+}
+function openCallDlg(code, num, ch){ DLG = {type:'call', code, num, ch, purpose:'', detail:''}; renderDlg(); }
+function openResultDlg(code, id){ const s = S.students[code]; const l = s && s.log.find(x => x.id === id); if (!l) return; DLG = {type:'res', code, id, res:l.res && !l.pending ? l.res : '', note:l.note || ''}; renderDlg(); }
+function renderDlg(){
+  const root = document.getElementById('dlgRoot'); if (!DLG){ root.innerHTML = ''; return; }
+  const s = S.students[DLG.code]; if (!s){ closeDlg(); return; }
+  let body = '';
+  if (DLG.type === 'call'){
+    const cs = contacts(s).filter(c => c.valid);
+    body = `<h3>${I(chIcon(DLG.ch), 20)} التواصل مع ولي أمر ${esc(sName(s))}</h3><div class="dsub"><span dir="ltr">${esc(s.cls)}</span></div>
+      <span class="l">الرقم</span><div class="chips">${cs.map(c => `<button class="chip ${c.num === DLG.num ? 'on' : ''}" data-dnum="${c.num}"><span class="phone" style="color:inherit">${fmtPhone(c.num)}</span> · ${esc(c.rels.join(' / '))}</button>`).join('')}</div>
+      <span class="l">طريقة التواصل</span><div class="chips">${['مكالمة', 'واتساب', 'رسالة نصية'].map(c => `<button class="chip ${c === DLG.ch ? 'on' : ''}" data-dch="${c}">${I(chIcon(c), 14)} ${c}</button>`).join('')}</div>
+      <span class="l">الهدف من التواصل</span><div class="chips">${PURPOSES.map(c => `<button class="chip ${c === DLG.purpose ? 'on' : ''}" data-dpp="${c}">${c}</button>`).join('')}</div>
+      <span class="l">تفاصيل (اختياري)</span><input class="field" id="dDetail" value="${esc(DLG.detail)}" placeholder="مثلا: غياب يومي الإثنين والثلاثاء">
+      <div class="acts2"><button class="btn ${DLG.ch === 'واتساب' ? 'wa' : ''}" data-dlg="go">${I(chIcon(DLG.ch), 18)} ${chLabel(DLG.ch)}</button><button class="btn ghost" data-dlg="cancel">إلغاء</button></div>`;
+  } else {
+    const l = s.log.find(x => x.id === DLG.id); if (!l){ closeDlg(); return; }
+    const opts = l.ch === 'مكالمة' ? CALL_RES : MSG_RES;
+    body = `<h3>${I(IC.log, 20)} نتيجة التواصل مع ولي أمر ${esc(sName(s))}</h3>
+      <div class="dsub">${esc(l.ch)}${l.purpose ? ' · ' + esc(l.purpose) : ''}${l.num ? ` · <span class="phone" style="font-weight:500;color:inherit">${fmtPhone(l.num)}</span>` : ''} · ${fmtDate(l.d)}</div>
+      ${l.detail ? `<div class="dsub">${esc(l.detail)}</div>` : ''}
+      <span class="l">ماذا حدث؟</span><div class="chips">${opts.map(c => `<button class="chip ${c === DLG.res ? 'on' : ''}" data-drr="${c}">${c}</button>`).join('')}</div>
+      <span class="l">الملاحظات</span><textarea class="field" id="dNote" placeholder="ماذا قال ولي الأمر؟ ما الذي اتُّفق عليه؟">${esc(DLG.note)}</textarea>
+      <div class="acts2"><button class="btn" data-dlg="save">${I(IC.check, 18)} حفظ</button><button class="btn ghost" data-dlg="later">لاحقا</button></div>`;
+  }
+  root.innerHTML = `<div class="dscrim" data-dlg="${DLG.type === 'call' ? 'cancel' : 'later'}"></div><div class="card dlg" role="dialog" aria-modal="true">${body}</div>`;
+  const dd = document.getElementById('dDetail'); if (dd) dd.oninput = e => DLG.detail = e.target.value;
+  const dn = document.getElementById('dNote'); if (dn) dn.oninput = e => DLG.note = e.target.value;
+}
+function openExternal(url){ const a = document.createElement('a'); a.href = url; if (/^https:/.test(url)){ a.target = '_blank'; a.rel = 'noopener noreferrer'; } document.body.appendChild(a); a.click(); a.remove(); }
+function dlgClick(ds){
+  if (!DLG) return;
+  if (ds.dnum){ DLG.num = ds.dnum; return renderDlg(); }
+  if (ds.dch){ DLG.ch = ds.dch; return renderDlg(); }
+  if (ds.dpp){ DLG.purpose = ds.dpp; return renderDlg(); }
+  if (ds.drr){ DLG.res = ds.drr; return renderDlg(); }
+  const s = S.students[DLG.code];
+  if (ds.dlg === 'cancel' || ds.dlg === 'later'){ ui.await = null; closeDlg(); return; }
+  if (ds.dlg === 'go'){
+    if (!DLG.purpose) return toast('اختر الهدف من التواصل');
+    const l = {id:uid(), d:nowLocal(), ch:DLG.ch, purpose:DLG.purpose, detail:clean(DLG.detail), num:DLG.num, res:'', note:'', pending:true, u:Date.now()};
+    s.log.unshift(l); touch(s);
+    ui.await = {code:s.code, id:l.id};
+    const url = DLG.ch === 'مكالمة' ? 'tel:' + DLG.num : DLG.ch === 'واتساب' ? waLink(DLG.num, '') : smsLink(DLG.num, '');
+    closeDlg();
+    openExternal(url);
+    saveNow(); persistSession(true);
+    if (ui.open === s.code){ keepScroll(); renderSheet(); }
+    setTimeout(() => { if (!document.hidden) maybeAskResult(); }, 2500);
+    return;
+  }
+  if (ds.dlg === 'save'){
+    if (!DLG.res) return toast('اختر ما حدث في التواصل');
+    const l = s.log.find(x => x.id === DLG.id);
+    if (l){ l.res = DLG.res; l.note = clean(DLG.note); l.pending = false; l.u = Date.now(); touch(s); }
+    ui.await = null; closeDlg(); toast('سُجلت النتيجة في سجل التواصل');
+    if (ui.open === s.code){ keepScroll(); renderSheet(); } else renderView();
+    refreshBadges();
+  }
+}
+function maybeAskResult(onEnter){
+  if (!unlocked || DLG) return;
+  let target = null;
+  if (ui.await){ const s = S.students[ui.await.code]; const l = s && s.log.find(x => x.id === ui.await.id); if (l && l.pending) target = ui.await; else ui.await = null; }
+  if (!target && onEnter){
+    const p = allLogs().filter(x => x.l.pending && Date.now() - new Date(x.l.d).getTime() < 12 * 3600000)[0];
+    if (p) target = {code:p.s.code, id:p.l.id};
+  }
+  if (target) openResultDlg(target.code, target.id);
+}
+
 /* ================= global events ================= */
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-nav],[data-act],[data-open],[data-f],[data-call],[data-primary],[data-delphone],[data-reason],[data-res],[data-dellog],[data-showcls],[data-copycls],[data-printcls],[data-mk],[data-saverow],[data-deltpl]');
+  const t = e.target.closest('[data-dlg],[data-dnum],[data-dch],[data-dpp],[data-drr],[data-callask],[data-msglog],[data-complete],[data-nav],[data-act],[data-open],[data-f],[data-primary],[data-delphone],[data-reason],[data-dellog],[data-showcls],[data-copycls],[data-printcls],[data-mk],[data-saverow],[data-deltpl]');
   if (!t || !unlocked) return;
   const ds = t.dataset;
   if (ds.nav){ closeSheetQuiet(); go(ds.nav); return; }
   if (ds.open){ e.preventDefault(); ui.sheetScroll = 0; openStudent(ds.open); return; }
   if (ds.f){ ui.f[ds.f] = !ui.f[ds.f]; t.classList.toggle('on', ui.f[ds.f]); ui.limit = 60; renderResults(); return; }
-  if (ds.call){
-    const [code, num, ch] = ds.call.split('|');
-    e.stopPropagation();
-    ui.pending = {code, num, ch};
-    if (ui.open !== code){ ui.open = code; }
-    setTimeout(() => { ui.sheetScroll = 0; renderSheet(); }, 50);
-    return;
-  }
-  if (ds.res){ const s = S.students[ui.open]; const p = ui.pending; if (s && p){ s.log.unshift({id:uid(), d:nowLocal(), ch:p.ch, res:ds.res, num:p.num, note:''}); touch(s); } ui.pending = null; keepScroll(); renderSheet(); toast('سُجل في سجل التواصل'); return; }
+  if (ds.dlg || ds.dnum || ds.dch || ds.dpp || ds.drr){ dlgClick(ds); return; }
+  if (ds.callask){ e.stopPropagation(); const [code, num, ch] = ds.callask.split('|'); openCallDlg(code, num, ch); return; }
+  if (ds.complete){ const [code, id] = ds.complete.split('|'); openResultDlg(code, id); return; }
+  if (ds.msglog){ const [code, num, ch] = ds.msglog.split('|'); const st = S.students[code]; const tp = S.settings.templates.find(x => x.id === (ui.sheetTpl || S.settings.templates[0]?.id)); st.log.unshift({id:uid(), d:nowLocal(), ch, purpose:tp ? tp.title : '', res:'تم الإرسال', num, note:'', u:Date.now()}); touch(st); setTimeout(() => { keepScroll(); renderSheet(); }, 300); return; }
   if (ds.primary){ const s = S.students[ui.open]; s.primary = ds.primary; touch(s); keepScroll(); renderSheet(); return; }
   if (ds.delphone){ const s = S.students[ui.open]; if (!confirm('حذف هذا الرقم؟')) return; s.extra.phones = s.extra.phones.filter(p => p.id !== ds.delphone); (s.del = s.del || []).push(ds.delphone); touch(s); keepScroll(); renderSheet(); return; }
   if (ds.reason){ const s = S.students[ui.open]; const r = ds.reason; s.flag.reasons = s.flag.reasons.includes(r) ? s.flag.reasons.filter(x => x !== r) : [...s.flag.reasons, r]; touch(s); keepScroll(); renderSheet(); return; }
@@ -1330,7 +1455,6 @@ document.addEventListener('click', async e => {
     case 'lock': lock(); break;
     case 'close': closeSheet(); break;
     case 'more': ui.limit += 100; renderResults(); break;
-    case 'nopending': ui.pending = null; keepScroll(); renderSheet(); break;
     case 'copymsg': { const ok = await copyText($('#msgText').value); toast(ok ? 'نُسخت الرسالة' : 'تعذر النسخ'); break; }
     case 'exportapp': exportApp(); break;
     case 'install': if (installEvt){ installEvt.prompt(); installEvt = null; t.classList.add('hidden'); } break;
@@ -1342,18 +1466,18 @@ document.addEventListener('click', async e => {
     case 'addtpl': S.settings.templates.push({id:uid(), title:'نموذج جديد', body:'السلام عليكم،\n… {التلميذ} … {القسم} …\n{المؤسسة}'}); touch(); renderView(); break;
     case 'wipe': {
       const w = prompt('اكتب كلمة «حذف» لتأكيد مسح كل المعطيات من هذا المتصفح:');
-      if (w && w.trim() === 'حذف'){ try { localStorage.removeItem(LS_KEY); } catch(_){} unlocked = false; S = null; SESS = null; $('#app').innerHTML = ''; $('#app').classList.add('hidden'); $('#lock').classList.remove('hidden'); renderLock(EMBEDDED ? 'unlock' : 'setup'); }
+      if (w && w.trim() === 'حذف'){ try { localStorage.removeItem(LS_KEY); } catch(_){} idbDel('s'); unlocked = false; S = null; SESS = null; $('#app').innerHTML = ''; $('#app').classList.add('hidden'); $('#lock').classList.remove('hidden'); renderLock(EMBEDDED ? 'unlock' : 'setup'); }
       break;
     }
   }
 });
 function keepScroll(){ const sh = document.querySelector('.sheet'); ui.sheetScroll = sh ? sh.scrollTop : 0; }
-function closeSheetQuiet(){ ui.open = null; ui.pending = null; $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; }
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && ui.open) closeSheet(); });
+function closeSheetQuiet(){ ui.open = null; $('#sheetRoot').innerHTML = ''; document.body.style.overflow = ''; }
+document.addEventListener('keydown', e => { if (e.key === 'Escape'){ if (DLG){ ui.await = null; closeDlg(); } else if (ui.open) closeSheet(); } });
 
 /* ================= boot ================= */
 if (!HAS_SUBTLE && !window.NobleCrypto){ $('#lock').innerHTML = '<div class="lockbox"><b>هذا المتصفح لا يدعم التشفير. استعمل Chrome أو Edge أو Firefox.</b></div>'; }
-else renderLock(readLocalVault() || EMBEDDED ? 'unlock' : 'setup');
+else tryResume().then(ok => { if (!ok) renderLock(readLocalVault() || EMBEDDED ? 'unlock' : 'setup'); });
 </script>
 </body>
 </html>
