@@ -389,6 +389,14 @@ try { localStorage.setItem('__t', '1'); STORAGE_OK = localStorage.getItem('__t')
 function readLocalVault(){ if (!STORAGE_OK) return null; try { const v = JSON.parse(localStorage.getItem(LS_KEY) || 'null'); return v && v.ct ? v : null; } catch(e){ return null; } }
 function readEmbeddedVault(){ try { const t = document.getElementById('vault').textContent.trim(); if (!t) return null; const v = JSON.parse(t); return v && v.ct ? v : null; } catch(e){ return null; } }
 const EMBEDDED = readEmbeddedVault();
+const JOIN_KEY = 'ibnb_join';
+(function captureJoin(){ const m = location.hash.match(/join=([A-Za-z0-9_\-]+)/); if (m){ try { localStorage.setItem(JOIN_KEY, m[1]); } catch(e){} history.replaceState(null, '', location.pathname + location.search); } })();
+function pendingJoin(){ try { return localStorage.getItem(JOIN_KEY) || ''; } catch(e){ return ''; } }
+const b64u = s => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return s; };
+const USER_KEY = 'ibnb_device_user';
+function devUser(){ try { return localStorage.getItem(USER_KEY) || ''; } catch(e){ return ''; } }
+function setDevUser(v){ try { localStorage.setItem(USER_KEY, v); } catch(e){} }
 const HOSTED = location.protocol === 'https:' || location.hostname === 'localhost';
 let installEvt = null;
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; document.querySelectorAll('.installbtn').forEach(b => b.classList.remove('hidden')); });
@@ -669,13 +677,13 @@ async function syncNow(force){
         if (v && v.ct){
           const o = await openRemoteVault(v);
           if (!S) return;
-          S = upgrade(mergeStates(S, upgrade(o.state))); derivedVer++; D = null; changed = true;
+          const mine = S.settings.sync; S = upgrade(mergeStates(S, upgrade(o.state))); S.settings.sync = mine; derivedVer++; D = null; changed = true;
           // keep this device's sync settings (token) authoritative
         }
         SYNC.ref = head;
       }
       if (!head || SYNC.dirty){
-        const vault = await sealState(S, SESS);
+        const vault = await sealState(forRemote(S), SESS);
         const res = await remoteWrite(c, vault, head);
         if (res === false){ SYNC.ref = null; continue; }
         SYNC.ref = res; SYNC.dirty = false;
@@ -692,9 +700,10 @@ async function syncNow(force){
   }
   if (changed && unlocked){ if (ui.open) { keepScroll(); renderSheet(); } else renderView(); refreshBadges(); }
 }
+function forRemote(st){ return Object.assign({}, st, {settings: Object.assign({}, st.settings, {sync: undefined})}); }
 async function pushOnLock(st, sess){
   const c = syncCfg(st); if (!c || !SYNC.dirty || SYNC.busy || !SYNC.ref) return;
-  try { const v = await sealState(st, sess); const r = await remoteWrite(c, v, SYNC.ref); if (r){ SYNC.ref = r; SYNC.dirty = false; } } catch(e){}
+  try { const v = await sealState(forRemote(st), sess); const r = await remoteWrite(c, v, SYNC.ref); if (r){ SYNC.ref = r; SYNC.dirty = false; } } catch(e){}
 }
 setInterval(() => { if (unlocked && !document.hidden) syncNow(); }, 60000);
 addEventListener('online', () => { if (unlocked) syncNow(); });
@@ -733,11 +742,50 @@ async function tryResume(){
   } catch(e){ idbDel('s'); return false; }
 }
 
+
+/* ================= invitation link ================= */
+async function makeInvite(user, token){
+  const c = S.settings.sync; if (!c || !c.on) throw new Error('nosync');
+  const iv = rnd(12);
+  const ct = await aesEnc(SESS.K, iv, te.encode(JSON.stringify({o:c.owner, r:c.repo, t:token || c.token, u:user})));
+  const blob = b64u(btoa(JSON.stringify({s:b64e(SESS.salt), i:SESS.it, v:b64e(iv), c:b64e(ct)})));
+  return location.origin + location.pathname + '#join=' + blob;
+}
+async function acceptJoin(pw){
+  const j = JSON.parse(atob(unb64u(pendingJoin())));
+  const salt = b64d(j.s); const K = await deriveKey(pw, salt, j.i);
+  const cfg = JSON.parse(td.decode(await aesDec(K, b64d(j.v), b64d(j.c))));
+  SESS = {K, salt, it:j.i, pw};
+  S = emptyState(); S.updatedAt = 0; S.settings.sync = {on:true, owner:cfg.o, repo:cfg.r, token:cfg.t};
+  if (cfg.u) setDevUser(cfg.u);
+  try { localStorage.removeItem(JOIN_KEY); } catch(e){}
+  await saveNow();
+  SYNC.ref = null; SYNC.dirty = false; ui.view = 'search';
+  unlocked = true; // enterApp below starts the first sync
+  enterApp();
+}
+
 /* ================= lock screen ================= */
 let fails = 0, blockedUntil = 0;
 function renderLock(mode){
   const L = $('#lock');
   const head = `<div class="brand"><div class="mark">${I(IC.shield, 24)}</div><div><h1>تواصل · أولياء الأمور</h1><p>المدرسة الجماعاتية ابن بطوطة</p></div></div>`;
+  if (mode === 'join'){
+    L.innerHTML = `<form class="lockbox" id="fJoin" autocomplete="off">${head}
+      <div class="alert tl">${I(IC.users, 18)}<div>دعوة للانضمام إلى تطبيق التواصل مع أولياء الأمور. أدخل كلمة السر التي سلّمها لك المختص التربوي، فتُحمَّل المعطيات وتشتغل المزامنة وحدها.</div></div>
+      <label for="jp">كلمة السر</label><input class="field" id="jp" type="password" autocomplete="current-password" required>
+      <div class="err" id="lerr"></div>
+      <button class="btn block" type="submit" id="jbtn">${I(IC.lock, 18)} دخول</button>
+      <button type="button" class="btn ghost block installbtn ${installEvt ? '' : 'hidden'}" onclick="if(installEvt){installEvt.prompt();installEvt=null;this.classList.add('hidden')}">${I(IC.download, 18)} تثبيت التطبيق على الهاتف</button>
+      <p class="note">المعطيات مشفرة ولا تُفتح إلا بكلمة السر. يُقفل التطبيق تلقائيا بعد مدة دون استعمال.</p></form>`;
+    $('#jp').focus();
+    $('#fJoin').onsubmit = async e => {
+      e.preventDefault(); $('#jbtn').disabled = true; $('#lerr').textContent = 'جارٍ التحقق…';
+      try { await acceptJoin($('#jp').value); }
+      catch(err){ $('#jbtn').disabled = false; $('#lerr').textContent = 'كلمة السر غير صحيحة.'; }
+    };
+    return;
+  }
   if (mode === 'setup'){
     L.innerHTML = `<form class="lockbox" id="fSetup" autocomplete="off">${head}
       <div class="alert tl">${I(IC.lock, 18)}<div>أول استعمال: اختر كلمة سر. كل المعطيات ستُحفظ مشفرة بها على هذا الجهاز فقط.</div></div>
@@ -826,7 +874,7 @@ function enterApp(){
   unlocked = true; lastAct = Date.now(); cacheSess(); setTimeout(() => { persistSession(true); maybeAskResult(true); }, 300);
   $('#lock').classList.add('hidden'); $('#lock').innerHTML = '';
   $('#app').classList.remove('hidden');
-  if (!Object.keys(S.students).length) ui.view = 'settings';
+  if (!Object.keys(S.students).length && !syncCfg()) ui.view = 'settings';
   renderApp();
   if (syncCfg()) syncNow();
 }
@@ -895,7 +943,7 @@ function hlText(text){
 }
 function vSearch(m){
   const d = derive();
-  if (!d.list.length){ m.innerHTML = emptyData(); return; }
+  if (!d.list.length){ m.innerHTML = syncCfg() ? `<div class="card empty" style="padding:50px 24px">${I(IC.shield, 44)}<h3 style="color:var(--ink);margin:6px 0">جارٍ تحميل المعطيات…</h3><p>تُجلب المعطيات المشفرة من المزامنة. يتطلب ذلك اتصالا بالإنترنت.</p></div>` : emptyData(); return; }
   m.innerHTML = `
     <h2 class="h2">البحث عن تلميذ</h2>
     <p class="sub">بالاسم أو النسب، رقم مسار، اسم الأب أو الأم، رقم الهاتف أو العنوان (الدوار، الحي…)</p>
@@ -1068,8 +1116,8 @@ function bindSheet(s, tpl, sel){
   $('#tplSel').onchange = e => { ui.sheetTpl = e.target.value; ui.msgText = null; renderSheet(); };
   $('#msgDate').onchange = e => { ui.msgDate = e.target.value; ui.msgText = null; renderSheet(); };
   $('#msgText').oninput = e => { ui.msgText = e.target.value; ui.msgFor = s.code + sel; updMsgLinks(); };
-  $('#fConv').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); printConvocation(s, f.get('d'), f.get('t'), f.get('r')); s.log.unshift({id:uid(), d:nowLocal(), ch:'استدعاء مكتوب', purpose:'استدعاء', res:'', num:'', u:Date.now(), note:`استدعاء للحضور يوم ${fmtDate(f.get('d'))} ${f.get('t') || ''} — ${f.get('r')}`}); touch(s); renderSheet(); };
-  $('#fLog').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); s.log.unshift({id:uid(), d:f.get('d') || nowLocal(), ch:f.get('ch'), purpose:f.get('purpose'), res:f.get('res'), num:f.get('num'), note:clean(f.get('note')), u:Date.now()}); s.log.sort((a, b) => b.d.localeCompare(a.d)); touch(s); renderSheet(); toast('سُجل التواصل'); };
+  $('#fConv').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); printConvocation(s, f.get('d'), f.get('t'), f.get('r')); s.log.unshift({id:uid(), d:nowLocal(), ch:'استدعاء مكتوب', purpose:'استدعاء', res:'', num:'', u:Date.now(), by:devUser(), note:`استدعاء للحضور يوم ${fmtDate(f.get('d'))} ${f.get('t') || ''} — ${f.get('r')}`}); touch(s); renderSheet(); };
+  $('#fLog').onsubmit = e => { e.preventDefault(); const f = new FormData(e.target); s.log.unshift({id:uid(), d:f.get('d') || nowLocal(), ch:f.get('ch'), purpose:f.get('purpose'), res:f.get('res'), num:f.get('num'), note:clean(f.get('note')), u:Date.now(), by:devUser()}); s.log.sort((a, b) => b.d.localeCompare(a.d)); touch(s); renderSheet(); toast('سُجل التواصل'); };
   root.querySelector('.sheet').scrollTop = ui.sheetScroll || 0; ui.sheetScroll = 0;
 }
 
@@ -1174,7 +1222,9 @@ function vLog(m){
   let arr = allLogs();
   if (ui.lcls) arr = arr.filter(x => x.s.cls === ui.lcls);
   if (ui.lres) arr = arr.filter(x => x.l.res === ui.lres || x.l.ch === ui.lres || x.l.purpose === ui.lres || (ui.lres === '__pending' && x.l.pending));
+  if (ui.lby) arr = arr.filter(x => (x.l.by || '') === ui.lby);
   const pend = allLogs().filter(x => x.l.pending);
+  const users = [...new Set(allLogs().map(x => x.l.by).filter(Boolean))];
   const fl = sortStudents(d.list.filter(s => s.flag.on));
   m.innerHTML = `<h2 class="h2">سجل التواصل والتتبع</h2><p class="sub">كل الاتصالات والاستدعاءات المسجلة، مع لائحة التلاميذ في التتبع.</p>
   ${pend.length ? `<div class="card sec" style="margin-bottom:14px;border-color:#ecd49c;background:#fffaf0"><h4 style="color:var(--amber)">${I(IC.log, 17)} اتصالات تنتظر تسجيل النتيجة (${pend.length})</h4>${pend.map(({s, l}) => `<div class="logi"><div class="t"><b>${esc(sName(s))}</b><span class="tag cls" dir="ltr">${esc(s.cls)}</span><span class="tag">${esc(l.ch)}</span>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}<span class="d">${fmtDate(l.d)}</span><button class="btn sm" data-complete="${esc(s.code)}|${l.id}">تسجيل النتيجة</button></div></div>`).join('')}</div>` : ''}
@@ -1182,14 +1232,16 @@ function vLog(m){
   <div class="filters">
     <select class="chip ${ui.lcls ? 'on' : ''}" id="lcls"><option value="">كل الأقسام</option>${d.classes.map(c => `<option ${c === ui.lcls ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
     <select class="chip ${ui.lres ? 'on' : ''}" id="lres"><option value="">كل الحالات</option><option value="__pending" ${ui.lres === '__pending' ? 'selected' : ''}>بانتظار النتيجة</option>${[...new Set([...CHANNELS, ...PURPOSES, ...RESULTS, ...allLogs().map(x => x.l.res).filter(Boolean)])].map(c => `<option ${c === ui.lres ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+    ${users.length > 1 ? `<select class="chip ${ui.lby ? 'on' : ''}" id="lby"><option value="">كل المستعملين</option>${users.map(u => `<option ${u === ui.lby ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select>` : ''}
     <button class="btn sm ghost" data-act="exportlog" style="margin-inline-start:auto">${I(IC.download, 15)} تصدير Excel</button>
   </div>
   <div class="meta">${arr.length} عملية</div>
-  ${arr.length ? `<div class="card scroll"><table class="tbl stack"><thead><tr><th>التاريخ</th><th>التلميذ</th><th>القسم</th><th>الوسيلة</th><th>الهدف</th><th>النتيجة</th><th>ملاحظات</th></tr></thead><tbody>
-  ${arr.slice(0, 400).map(({s, l}) => `<tr><td style="white-space:nowrap;color:var(--muted);font-size:13px">${fmtDate(l.d)}</td><td><a href="#" data-open="${esc(s.code)}" style="font-weight:700;text-decoration:none">${esc(sName(s))}</a></td><td><span class="tag cls" dir="ltr">${esc(s.cls)}</span></td><td>${esc(l.ch)}</td><td>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}</td><td>${resTag(l, s)}</td><td class="w">${esc([l.detail, l.note].filter(Boolean).join(' — '))}</td></tr>`).join('')}
+  ${arr.length ? `<div class="card scroll"><table class="tbl stack"><thead><tr><th>التاريخ</th><th>التلميذ</th><th>القسم</th><th>الوسيلة</th><th>الهدف</th><th>النتيجة</th><th>ملاحظات</th><th>بواسطة</th></tr></thead><tbody>
+  ${arr.slice(0, 400).map(({s, l}) => `<tr><td style="white-space:nowrap;color:var(--muted);font-size:13px">${fmtDate(l.d)}</td><td><a href="#" data-open="${esc(s.code)}" style="font-weight:700;text-decoration:none">${esc(sName(s))}</a></td><td><span class="tag cls" dir="ltr">${esc(s.cls)}</span></td><td>${esc(l.ch)}</td><td>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}</td><td>${resTag(l, s)}</td><td class="w">${esc([l.detail, l.note].filter(Boolean).join(' — '))}</td><td style="font-size:12.5px;color:var(--muted)">${esc(l.by || '')}</td></tr>`).join('')}
   </tbody></table></div>` : `<div class="card empty">${I(IC.log, 40)}<div>لا توجد عمليات مسجلة</div></div>`}`;
   $('#lcls').onchange = e => { ui.lcls = e.target.value; renderView(); };
   $('#lres').onchange = e => { ui.lres = e.target.value; renderView(); };
+  if ($('#lby')) $('#lby').onchange = e => { ui.lby = e.target.value; renderView(); };
 }
 
 /* ================= view: settings ================= */
@@ -1230,6 +1282,24 @@ function vSettings(m){
         </div>
       </form>
       <div id="syncState" style="margin-top:10px">${syncStateHTML()}</div>
+    </div>
+
+    ${S.settings.sync && S.settings.sync.on ? `<div class="card sec wide">
+      <h4>${I(IC.users, 17)} إضافة شخص آخر بالرابط (مثلا السيد المدير)</h4>
+      <p class="lockhint" style="margin-top:0">يُنشأ رابط واحد يفتحه الشخص في هاتفه، فيُدخل كلمة السر فقط، وتُحمَّل المعطيات وتشتغل المزامنة وحدها. الرابط لا يُفتح دون كلمة السر، فأرسله عبر واتساب، وأعطه كلمة السر شفويا وليس في نفس الرسالة.</p>
+      <form class="form" id="fInv" autocomplete="off">
+        <div class="full"><label>اسم المستعمل</label><div class="chips" style="margin-bottom:6px">${userChoices().map(u => `<button type="button" class="chip" data-invuser="${esc(u)}">${esc(u)}</button>`).join('')}</div><input class="field" name="user" id="invUser" placeholder="الاسم والصفة" required></div>
+        <div class="full"><label>رمز خاص به (اختياري)</label><input class="field" name="token" type="password" dir="ltr" placeholder="github_pat_… — اتركه فارغا لاستعمال رمز هذا الجهاز"></div>
+        <div class="full"><button class="btn sm" type="submit">${I(IC.plus, 15)} إنشاء رابط الدعوة</button></div>
+      </form>
+      <div id="invOut"></div>
+    </div>` : ''}
+
+    <div class="card sec">
+      <h4>${I(IC.users, 17)} من يستعمل هذا الجهاز؟</h4>
+      <p class="lockhint" style="margin-top:0">يُكتب هذا الاسم مع كل اتصال أو رسالة تُسجَّل من هذا الجهاز، فتعرف في السجل من تواصل مع الأسرة. لا يُزامَن، فلكل جهاز اسمه.</p>
+      <div class="chips" style="margin-bottom:8px">${userChoices().map(u => `<button class="chip ${u === devUser() ? 'on' : ''}" data-setuser="${esc(u)}">${esc(u)}</button>`).join('')}</div>
+      <input class="field" id="devUser" value="${esc(devUser())}" placeholder="أو اكتب اسما آخر">
     </div>
 
     <div class="card sec">
@@ -1286,6 +1356,21 @@ function vSettings(m){
     SYNC.branch = null; SYNC.ref = null; SYNC.dirty = true; SYNC.status = 'busy';
     touch(); renderView(); syncNow(true);
   };
+  if ($('#fInv')){
+    m.querySelectorAll('[data-invuser]').forEach(b => b.onclick = e => { e.stopPropagation(); $('#invUser').value = b.dataset.invuser; m.querySelectorAll('[data-invuser]').forEach(x => x.classList.toggle('on', x === b)); });
+    $('#fInv').onsubmit = async e => {
+      e.preventDefault(); const f = new FormData(e.target);
+      const tok = String(f.get('token') || '').trim();
+      if (tok && !/^(github_pat_|ghp_)/.test(tok)) return toast('الرمز يجب أن يبدأ بـ github_pat_');
+      try {
+        const link = await makeInvite(clean(f.get('user')), tok);
+        const msg = 'السلام عليكم، هذا رابط تطبيق التواصل مع أولياء أمور تلاميذ ' + S.settings.school + '. افتحه في Chrome على هاتفك، ثبّت التطبيق، ثم أدخل كلمة السر التي سأعطيك إياها:\n' + link;
+        $('#invOut').innerHTML = `<div class="alert tl" style="margin-top:10px;display:block"><b>رابط الدعوة جاهز</b>${tok ? '' : '<br><span style="font-size:12.5px">يستعمل رمز هذا الجهاز.</span>'}<textarea class="field" readonly style="margin-top:8px;min-height:70px;direction:ltr;font-size:12px">${esc(link)}</textarea><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"><button class="btn sm" type="button" id="invCopy">${I(IC.copy, 15)} نسخ الرابط</button><a class="btn sm wa" href="https://wa.me/?text=${encodeURIComponent(msg)}" target="_blank" rel="noopener noreferrer">${I(IC.wa, 15)} إرسال عبر واتساب</a></div></div>`;
+        $('#invCopy').onclick = async () => toast(await copyText(link) ? 'نُسخ الرابط' : 'تعذر النسخ');
+      } catch(err){ toast('شغّل المزامنة أولا في هذا الجهاز'); }
+    };
+  }
+  $('#devUser').onchange = e => { setDevUser(e.target.value.trim()); renderView(); toast('حُفظ'); };
   $('#lockMin').onchange = e => { st.lockMin = +e.target.value; touch(); persistSession(true); toast('حُفظ'); };
   $('#fPw').onsubmit = async e => {
     e.preventDefault(); const f = new FormData(e.target);
@@ -1308,7 +1393,7 @@ async function mergeFile(f){
     let opened;
     try { opened = await openVault(v, null, {[v.salt + ':' + v.it]: (b64e(SESS.salt) === v.salt && SESS.it === v.it) ? SESS.K : undefined}); }
     catch(e){ const pw = prompt('هذه النسخة بكلمة سر مختلفة. اكتب كلمة سرها:'); if (!pw) return; opened = await openVault(v, pw); }
-    S = mergeStates(S, upgrade(opened.state)); upgrade(S); touch(); await saveNow(); renderApp(); toast('تم دمج النسخة');
+    const mine = S.settings.sync; S = mergeStates(S, upgrade(opened.state)); upgrade(S); S.settings.sync = mine; touch(); await saveNow(); renderApp(); toast('تم دمج النسخة');
   } catch(e){ toast('تعذر فتح النسخة: كلمة السر غير صحيحة أو الملف تالف'); }
 }
 
@@ -1326,7 +1411,7 @@ function exportXlsx(){
   if (!confirm('سيُنشأ ملف Excel غير مشفر يحتوي على أرقام الهواتف والعناوين. هل تريد المتابعة؟')) return;
   const d = derive();
   const rows = sortStudents([...d.list]).map(s => { const cs = contacts(s).filter(c => c.valid); const p = primaryPhone(s); return {'القسم':s.cls, 'رقم مسار':s.code, 'النسب':s.nom, 'الاسم':s.prenom, 'نوع الوصاية':s.tut, 'ولي الأمر':fullName(s.g), 'الهاتف الرئيسي':p ? p.num : '', 'أرقام أخرى':cs.filter(c => !p || c.num !== p.num).map(c => c.num + ' (' + c.rels.join('/') + ')').join(' ، '), 'العنوان':addresses(s)[0]?.a || '', 'للتتبع':s.flag.on ? s.flag.reasons.join('، ') || 'نعم' : ''}; });
-  const logs = allLogs().map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'الرقم':l.num || '', 'ملاحظات':l.note || ''}));
+  const logs = allLogs().map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'الرقم':l.num || '', 'ملاحظات':l.note || '', 'بواسطة':l.by || ''}));
   const wb = XLSX.utils.book_new();
   const ws1 = XLSX.utils.json_to_sheet(rows); ws1['!cols'] = [10, 13, 14, 14, 10, 22, 13, 30, 40, 16].map(w => ({wch:w}));
   XLSX.utils.book_append_sheet(wb, ws1, 'الأرقام والعناوين');
@@ -1336,7 +1421,7 @@ function exportXlsx(){
   download(`contacts-${todayISO()}.xlsx`, new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
 }
 function exportLogXlsx(){
-  const logs = allLogs().filter(x => (!ui.lcls || x.s.cls === ui.lcls)).map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'ملاحظات':l.note || ''}));
+  const logs = allLogs().filter(x => (!ui.lcls || x.s.cls === ui.lcls)).map(({s, l}) => ({'التاريخ':fmtDate(l.d), 'القسم':s.cls, 'رقم مسار':s.code, 'التلميذ':sName(s), 'الوسيلة':l.ch, 'الهدف':l.purpose || '', 'تفاصيل':l.detail || '', 'النتيجة':l.pending ? 'بانتظار النتيجة' : (l.res || ''), 'ملاحظات':l.note || '', 'بواسطة':l.by || ''}));
   if (!logs.length) return toast('السجل فارغ');
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(logs), 'سجل التواصل'); wb.Workbook = {Views:[{RTL:true}]};
   download(`sijil-tawasol-${todayISO()}.xlsx`, new Blob([XLSX.write(wb, {bookType:'xlsx', type:'array'})]));
@@ -1350,14 +1435,23 @@ function chLabel(ch){ return ch === 'مكالمة' ? 'اتصل الآن' : ch ==
 function chIcon(ch){ return ch === 'مكالمة' ? IC.phone : ch === 'واتساب' ? IC.wa : IC.sms; }
 function resTag(l){ if (l.pending) return `<span class="tag amb">بانتظار النتيجة</span>`; return l.res ? `<span class="tag ${BAD_RES.test(l.res) ? 'red' : 'grn'}">${esc(l.res)}</span>` : ''; }
 function logItemHTML(s, l){
-  return `<div class="logi"><div class="t"><span class="tag cls">${esc(l.ch)}</span>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}${resTag(l)}${l.num ? `<span class="phone" style="font-size:13px">${fmtPhone(l.num)}</span>` : ''}<span class="d">${fmtDate(l.d)}</span>${l.pending ? `<button class="btn sm" data-complete="${esc(s.code)}|${l.id}">تسجيل النتيجة</button>` : ''}<button class="star" data-dellog="${l.id}" aria-label="حذف">${I(IC.trash, 15)}</button></div>${l.detail ? `<p>${esc(l.detail)}</p>` : ''}${l.note ? `<p><b>الملاحظات:</b> ${esc(l.note)}</p>` : ''}</div>`;
+  return `<div class="logi"><div class="t"><span class="tag cls">${esc(l.ch)}</span>${l.purpose ? `<span class="tag flag">${esc(l.purpose)}</span>` : ''}${resTag(l)}${l.num ? `<span class="phone" style="font-size:13px">${fmtPhone(l.num)}</span>` : ''}<span class="d">${l.by ? esc(l.by) + ' · ' : ''}${fmtDate(l.d)}</span>${l.pending ? `<button class="btn sm" data-complete="${esc(s.code)}|${l.id}">تسجيل النتيجة</button>` : ''}<button class="star" data-dellog="${l.id}" aria-label="حذف">${I(IC.trash, 15)}</button></div>${l.detail ? `<p>${esc(l.detail)}</p>` : ''}${l.note ? `<p><b>الملاحظات:</b> ${esc(l.note)}</p>` : ''}</div>`;
 }
-function openCallDlg(code, num, ch){ DLG = {type:'call', code, num, ch, purpose:'', detail:''}; renderDlg(); }
+function userChoices(){ const st = S.settings; return [st.sign1 + ' ' + st.sign1Name, st.sign2 + ' ' + st.sign2Name].map(x => x.trim()).filter(Boolean); }
+function openUserDlg(){ DLG = {type:'user'}; renderDlg(); }
+function openCallDlg(code, num, ch){ if (!devUser()){ DLG = {type:'user', then:[code, num, ch]}; return renderDlg(); } DLG = {type:'call', code, num, ch, purpose:'', detail:''}; renderDlg(); }
 function openResultDlg(code, id){ const s = S.students[code]; const l = s && s.log.find(x => x.id === id); if (!l) return; DLG = {type:'res', code, id, res:l.res && !l.pending ? l.res : '', note:l.note || ''}; renderDlg(); }
 function renderDlg(){
   const root = document.getElementById('dlgRoot'); if (!DLG){ root.innerHTML = ''; return; }
-  const s = S.students[DLG.code]; if (!s){ closeDlg(); return; }
+  const s = DLG.type === 'user' ? null : S.students[DLG.code]; if (DLG.type !== 'user' && !s){ closeDlg(); return; }
   let body = '';
+  if (DLG.type === 'user'){
+    root.innerHTML = `<div class="dscrim" data-dlg="cancel"></div><div class="card dlg" role="dialog" aria-modal="true"><h3>${I(IC.users, 20)} من يستعمل هذا الجهاز؟</h3><div class="dsub">يُكتب الاسم مع كل اتصال في سجل التواصل. يمكن تغييره من الإعدادات.</div>
+      <span class="l">اختر</span><div class="chips">${userChoices().map(u => `<button class="chip" data-setuser="${esc(u)}">${esc(u)}</button>`).join('')}</div>
+      <span class="l">أو اكتب اسما آخر</span><input class="field" id="dUser" placeholder="الاسم والصفة">
+      <div class="acts2"><button class="btn" data-dlg="saveuser">${I(IC.check, 18)} متابعة</button></div></div>`;
+    return;
+  }
   if (DLG.type === 'call'){
     const cs = contacts(s).filter(c => c.valid);
     body = `<h3>${I(chIcon(DLG.ch), 20)} التواصل مع ولي أمر ${esc(sName(s))}</h3><div class="dsub"><span dir="ltr">${esc(s.cls)}</span></div>
@@ -1387,11 +1481,12 @@ function dlgClick(ds){
   if (ds.dch){ DLG.ch = ds.dch; return renderDlg(); }
   if (ds.dpp){ DLG.purpose = ds.dpp; return renderDlg(); }
   if (ds.drr){ DLG.res = ds.drr; return renderDlg(); }
+  if (ds.dlg === 'saveuser'){ const v = clean((document.getElementById('dUser') || {}).value); if (!v) return toast('اختر اسما أو اكتبه'); setDevUser(v); const th = DLG.then; closeDlg(); if (th) openCallDlg(...th); return; }
   const s = S.students[DLG.code];
   if (ds.dlg === 'cancel' || ds.dlg === 'later'){ ui.await = null; closeDlg(); return; }
   if (ds.dlg === 'go'){
     if (!DLG.purpose) return toast('اختر الهدف من التواصل');
-    const l = {id:uid(), d:nowLocal(), ch:DLG.ch, purpose:DLG.purpose, detail:clean(DLG.detail), num:DLG.num, res:'', note:'', pending:true, u:Date.now()};
+    const l = {id:uid(), d:nowLocal(), ch:DLG.ch, purpose:DLG.purpose, detail:clean(DLG.detail), num:DLG.num, res:'', note:'', pending:true, u:Date.now(), by:devUser()};
     s.log.unshift(l); touch(s);
     ui.await = {code:s.code, id:l.id};
     const url = DLG.ch === 'مكالمة' ? 'tel:' + DLG.num : DLG.ch === 'واتساب' ? waLink(DLG.num, '') : smsLink(DLG.num, '');
@@ -1405,7 +1500,7 @@ function dlgClick(ds){
   if (ds.dlg === 'save'){
     if (!DLG.res) return toast('اختر ما حدث في التواصل');
     const l = s.log.find(x => x.id === DLG.id);
-    if (l){ l.res = DLG.res; l.note = clean(DLG.note); l.pending = false; l.u = Date.now(); touch(s); }
+    if (l){ l.res = DLG.res; l.note = clean(DLG.note); l.pending = false; l.u = Date.now(); if (!l.by) l.by = devUser(); touch(s); }
     ui.await = null; closeDlg(); toast('سُجلت النتيجة في سجل التواصل');
     if (ui.open === s.code){ keepScroll(); renderSheet(); } else renderView();
     refreshBadges();
@@ -1424,16 +1519,17 @@ function maybeAskResult(onEnter){
 
 /* ================= global events ================= */
 document.addEventListener('click', async e => {
-  const t = e.target.closest('[data-dlg],[data-dnum],[data-dch],[data-dpp],[data-drr],[data-callask],[data-msglog],[data-complete],[data-nav],[data-act],[data-open],[data-f],[data-primary],[data-delphone],[data-reason],[data-dellog],[data-showcls],[data-copycls],[data-printcls],[data-mk],[data-saverow],[data-deltpl]');
+  const t = e.target.closest('[data-setuser],[data-dlg],[data-dnum],[data-dch],[data-dpp],[data-drr],[data-callask],[data-msglog],[data-complete],[data-nav],[data-act],[data-open],[data-f],[data-primary],[data-delphone],[data-reason],[data-dellog],[data-showcls],[data-copycls],[data-printcls],[data-mk],[data-saverow],[data-deltpl]');
   if (!t || !unlocked) return;
   const ds = t.dataset;
   if (ds.nav){ closeSheetQuiet(); go(ds.nav); return; }
   if (ds.open){ e.preventDefault(); ui.sheetScroll = 0; openStudent(ds.open); return; }
   if (ds.f){ ui.f[ds.f] = !ui.f[ds.f]; t.classList.toggle('on', ui.f[ds.f]); ui.limit = 60; renderResults(); return; }
+  if (ds.setuser != null){ setDevUser(ds.setuser); if (DLG && DLG.type === 'user'){ const th = DLG.then; closeDlg(); if (th) openCallDlg(...th); else toast('حُفظ'); } else { renderView(); toast('حُفظ'); } return; }
   if (ds.dlg || ds.dnum || ds.dch || ds.dpp || ds.drr){ dlgClick(ds); return; }
   if (ds.callask){ e.stopPropagation(); const [code, num, ch] = ds.callask.split('|'); openCallDlg(code, num, ch); return; }
   if (ds.complete){ const [code, id] = ds.complete.split('|'); openResultDlg(code, id); return; }
-  if (ds.msglog){ const [code, num, ch] = ds.msglog.split('|'); const st = S.students[code]; const tp = S.settings.templates.find(x => x.id === (ui.sheetTpl || S.settings.templates[0]?.id)); st.log.unshift({id:uid(), d:nowLocal(), ch, purpose:tp ? tp.title : '', res:'تم الإرسال', num, note:'', u:Date.now()}); touch(st); setTimeout(() => { keepScroll(); renderSheet(); }, 300); return; }
+  if (ds.msglog){ const [code, num, ch] = ds.msglog.split('|'); const st = S.students[code]; const tp = S.settings.templates.find(x => x.id === (ui.sheetTpl || S.settings.templates[0]?.id)); st.log.unshift({id:uid(), d:nowLocal(), ch, purpose:tp ? tp.title : '', res:'تم الإرسال', num, note:'', u:Date.now(), by:devUser()}); touch(st); setTimeout(() => { keepScroll(); renderSheet(); }, 300); return; }
   if (ds.primary){ const s = S.students[ui.open]; s.primary = ds.primary; touch(s); keepScroll(); renderSheet(); return; }
   if (ds.delphone){ const s = S.students[ui.open]; if (!confirm('حذف هذا الرقم؟')) return; s.extra.phones = s.extra.phones.filter(p => p.id !== ds.delphone); (s.del = s.del || []).push(ds.delphone); touch(s); keepScroll(); renderSheet(); return; }
   if (ds.reason){ const s = S.students[ui.open]; const r = ds.reason; s.flag.reasons = s.flag.reasons.includes(r) ? s.flag.reasons.filter(x => x !== r) : [...s.flag.reasons, r]; touch(s); keepScroll(); renderSheet(); return; }
@@ -1477,7 +1573,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape'){ if (DLG){ u
 
 /* ================= boot ================= */
 if (!HAS_SUBTLE && !window.NobleCrypto){ $('#lock').innerHTML = '<div class="lockbox"><b>هذا المتصفح لا يدعم التشفير. استعمل Chrome أو Edge أو Firefox.</b></div>'; }
-else tryResume().then(ok => { if (!ok) renderLock(readLocalVault() || EMBEDDED ? 'unlock' : 'setup'); });
+else tryResume().then(ok => { if (!ok) renderLock(readLocalVault() || EMBEDDED ? 'unlock' : pendingJoin() ? 'join' : 'setup'); });
 </script>
 </body>
 </html>
